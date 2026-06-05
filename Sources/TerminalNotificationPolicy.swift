@@ -192,6 +192,7 @@ struct TerminalNotificationPolicyRequest: Sendable {
     let title: String
     let subtitle: String
     let body: String
+    let bodyFormat: TerminalNotificationBodyFormat
     let cwd: String?
     let isAppFocused: Bool
     let isFocusedPanel: Bool
@@ -203,6 +204,7 @@ struct TerminalNotificationPolicyRequest: Sendable {
         title: String,
         subtitle: String,
         body: String,
+        bodyFormat: TerminalNotificationBodyFormat = .plain,
         cwd: String?,
         isAppFocused: Bool,
         isFocusedPanel: Bool
@@ -213,6 +215,7 @@ struct TerminalNotificationPolicyRequest: Sendable {
         self.title = title
         self.subtitle = subtitle
         self.body = body
+        self.bodyFormat = bodyFormat
         self.cwd = cwd
         self.isAppFocused = isAppFocused
         self.isFocusedPanel = isFocusedPanel

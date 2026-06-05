@@ -198,6 +198,119 @@ await hooks.event({
     }
   }
 });
+await hooks.event({
+  event: {
+    type: "session.updated",
+    properties: {
+      info: {
+        id: "opencode-session-test",
+        directory: "/tmp/opencode-project"
+      }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.status",
+    properties: {
+      sessionID: "opencode-session-test",
+      status: { type: "idle" }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.idle",
+    properties: {
+      sessionID: "opencode-session-test"
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.status",
+    properties: {
+      sessionID: "opencode-session-test",
+      status: { type: "busy" }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.status",
+    properties: {
+      sessionID: "opencode-session-test",
+      status: { type: "idle" }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.updated",
+    properties: {
+      info: {
+        id: "opencode-session-test",
+        directory: "/tmp/opencode-project"
+      }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.status",
+    properties: {
+      sessionID: "opencode-session-test",
+      status: { type: "idle" }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.created",
+    properties: {
+      info: {
+        id: "opencode-idle-only-session-test",
+        directory: "/tmp/opencode-project"
+      }
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.idle",
+    properties: {
+      sessionID: "opencode-idle-only-session-test"
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.deleted",
+    properties: {
+      sessionID: "opencode-idle-only-session-test"
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.idle",
+    properties: {
+      sessionID: "opencode-idle-only-session-test"
+    }
+  }
+});
+await hooks.event({
+  event: {
+    type: "session.updated",
+    properties: {
+      info: {
+        id: "opencode-session-test",
+        directory: "/tmp/opencode-project",
+        time: { archived: 1710000000000 }
+      }
+    }
+  }
+});
 """
         check = subprocess.run(
             [bun, "--eval", check_source],
@@ -221,8 +334,14 @@ await hooks.event({
         if "hooks opencode session-start" not in args_log:
             print(f"FAIL: plugin did not invoke hooks opencode session-start, got {args_log!r}")
             return 1
-        if args_log.count("hooks opencode session-start") != 1:
-            print(f"FAIL: plugin invoked duplicate session-start hooks, got {args_log!r}")
+        if args_log.count("hooks opencode session-start") != 2:
+            print(f"FAIL: plugin did not start both test sessions, got {args_log!r}")
+            return 1
+        if args_log.count("hooks opencode stop") != 4:
+            print(f"FAIL: plugin did not reset active stop dedupe or ignore ended sessions, got {args_log!r}")
+            return 1
+        if args_log.count("hooks opencode session-end") != 2:
+            print(f"FAIL: plugin did not invoke archived and deleted session-end hooks, got {args_log!r}")
             return 1
         if '"session_id":"opencode-session-test"' not in stdin_log or '"/tmp/opencode-project"' not in stdin_log:
             print(f"FAIL: plugin did not pass expected session payload, got {stdin_log!r}")

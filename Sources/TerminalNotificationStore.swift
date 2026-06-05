@@ -699,6 +699,7 @@ struct TerminalNotification: Identifiable, Hashable {
     let title: String
     let subtitle: String
     let body: String
+    let bodyFormat: TerminalNotificationBodyFormat
     let createdAt: Date
     var isRead: Bool
     var paneFlash: Bool = true
@@ -712,6 +713,7 @@ struct TerminalNotification: Identifiable, Hashable {
         title: String,
         subtitle: String,
         body: String,
+        bodyFormat: TerminalNotificationBodyFormat = .plain,
         createdAt: Date,
         isRead: Bool,
         paneFlash: Bool = true,
@@ -724,6 +726,7 @@ struct TerminalNotification: Identifiable, Hashable {
         self.title = title
         self.subtitle = subtitle
         self.body = body
+        self.bodyFormat = bodyFormat
         self.createdAt = createdAt
         self.isRead = isRead
         self.paneFlash = paneFlash
@@ -758,6 +761,24 @@ final class TerminalNotificationStore: ObservableObject {
 
     static let categoryIdentifier = "com.cmuxterm.app.userNotification"
     static let actionShowIdentifier = "com.cmuxterm.app.userNotification.show"
+    private static let codingAgentNotificationTitles: Set<String> = [
+        "Antigravity",
+        "Amp",
+        "Claude Code",
+        "CodeBuddy",
+        "Codex",
+        "Copilot",
+        "Cursor",
+        "Factory",
+        "Gemini",
+        "Grok",
+        "Hermes Agent",
+        "Kiro",
+        "OpenCode",
+        "Pi",
+        "Qoder",
+        "Rovo Dev",
+    ]
     private enum AuthorizationRequestOrigin: String {
         case notificationDelivery = "notification_delivery"
         case settingsButton = "settings_button"
@@ -1159,6 +1180,7 @@ final class TerminalNotificationStore: ObservableObject {
         title: String,
         subtitle: String,
         body: String,
+        bodyFormat: TerminalNotificationBodyFormat = .plain,
         cooldownKey: String? = nil,
         cooldownInterval: TimeInterval? = nil,
         clickAction: TerminalNotificationClickAction? = nil
@@ -1199,7 +1221,8 @@ final class TerminalNotificationStore: ObservableObject {
             surfaceId: surfaceId,
             title: title,
             subtitle: subtitle,
-            body: body
+            body: body,
+            bodyFormat: bodyFormat
         )
         guard !policyContext.hooks.isEmpty else {
             applyNotification(
@@ -1299,7 +1322,8 @@ final class TerminalNotificationStore: ObservableObject {
         surfaceId: UUID?,
         title: String,
         subtitle: String,
-        body: String
+        body: String,
+        bodyFormat: TerminalNotificationBodyFormat
     ) -> NotificationPolicyContext {
         let appDelegate = AppDelegate.shared
         let context = appDelegate?.contextContainingTabId(tabId)
@@ -1329,6 +1353,7 @@ final class TerminalNotificationStore: ObservableObject {
                 title: title,
                 subtitle: subtitle,
                 body: body,
+                bodyFormat: bodyFormat,
                 cwd: cwd,
                 isAppFocused: isAppFocused,
                 isFocusedPanel: isFocusedPanel
@@ -1354,6 +1379,7 @@ final class TerminalNotificationStore: ObservableObject {
                 title: payload.title,
                 subtitle: payload.subtitle,
                 body: payload.body,
+                bodyFormat: request.bodyFormat,
                 cwd: request.cwd,
                 isAppFocused: request.isAppFocused,
                 isFocusedPanel: request.isFocusedPanel
@@ -1372,6 +1398,7 @@ final class TerminalNotificationStore: ObservableObject {
         cooldownReservation: NotificationCooldownReservation?,
         clickAction: TerminalNotificationClickAction?
     ) {
+        let subtitle = subtitleWithCodingAgentContext(for: request)
         let shouldSuppressExternalDelivery = shouldSuppressExternalDelivery(
             tabId: request.tabId,
             surfaceId: request.surfaceId
@@ -1382,8 +1409,9 @@ final class TerminalNotificationStore: ObservableObject {
             surfaceId: request.surfaceId,
             panelId: request.panelId,
             title: request.title,
-            subtitle: request.subtitle,
+            subtitle: subtitle,
             body: request.body,
+            bodyFormat: request.bodyFormat,
             createdAt: now,
             isRead: !effects.markUnread,
             paneFlash: effects.paneFlash,
@@ -1469,6 +1497,51 @@ final class TerminalNotificationStore: ObservableObject {
             shouldSuppressExternalDelivery: shouldSuppressExternalDelivery,
             effects: effects
         )
+    }
+
+    private func subtitleWithCodingAgentContext(for request: TerminalNotificationPolicyRequest) -> String {
+        let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.codingAgentNotificationTitles.contains(title) else {
+            return request.subtitle
+        }
+
+        var parts = trimmedNotificationParts(from: request.subtitle)
+        for contextPart in codingAgentContextParts(tabId: request.tabId, panelId: request.panelId) {
+            appendNotificationPart(contextPart, to: &parts)
+        }
+        return parts.joined(separator: " • ")
+    }
+
+    private func codingAgentContextParts(tabId: UUID, panelId: UUID?) -> [String] {
+        let appDelegate = AppDelegate.shared
+        let context = appDelegate?.contextContainingTabId(tabId)
+        let tabManager = context?.tabManager ?? appDelegate?.tabManagerFor(tabId: tabId) ?? appDelegate?.tabManager
+        guard let workspace = tabManager?.tabs.first(where: { $0.id == tabId }) else {
+            return []
+        }
+
+        var parts: [String] = []
+        appendNotificationPart(workspace.title, to: &parts)
+        if let panelId {
+            appendNotificationPart(workspace.panelTitle(panelId: panelId), to: &parts)
+        }
+        return parts
+    }
+
+    private func trimmedNotificationParts(from value: String) -> [String] {
+        value
+            .split(separator: "•", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func appendNotificationPart(_ value: String?, to parts: inout [String]) {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return
+        }
+        guard !parts.contains(where: { $0 == trimmed }) else { return }
+        parts.append(trimmed)
     }
 
     private func shouldSuppressExternalDelivery(tabId: UUID, surfaceId: UUID?) -> Bool {
@@ -1770,6 +1843,7 @@ final class TerminalNotificationStore: ObservableObject {
             title: notification.title,
             subtitle: notification.subtitle,
             body: notification.body,
+            bodyFormat: notification.bodyFormat,
             createdAt: notification.createdAt,
             isRead: notification.isRead,
             paneFlash: notification.paneFlash,
@@ -1850,6 +1924,7 @@ final class TerminalNotificationStore: ObservableObject {
                 title: notification.title,
                 subtitle: notification.subtitle,
                 body: notification.body,
+                bodyFormat: notification.bodyFormat,
                 createdAt: notification.createdAt,
                 isRead: notification.isRead,
                 paneFlash: notification.paneFlash,
