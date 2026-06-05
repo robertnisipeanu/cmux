@@ -1,0 +1,110 @@
+name: Fork build (unsigned)
+
+# Builds a NORMAL (non-DEV) cmux.app from this fork and publishes it as a
+# GitHub Release. The app is the Release configuration of the `cmux` scheme
+# (product name "cmux", production bundle id) — NOT the "cmux DEV" build that
+# scripts/reload.sh produces. It is NOT Apple-signed or notarized (the fork has
+# no Apple Developer secrets), so on first launch: right-click the app → Open,
+# or run `xattr -dr com.apple.quarantine "/Applications/cmux.app"`.
+#
+# Trigger manually from the Actions tab (workflow_dispatch). Uses a distinct
+# `fork-v*` tag so it never collides with the upstream signed release.yml (which
+# triggers on `v*` and requires Apple secrets this fork lacks).
+
+on:
+  # Push a `fork-vX.Y.Z` tag to build + publish a Release. (Distinct from the
+  # upstream signed release which triggers on `v*`.) Also runnable from the
+  # Actions tab once this workflow is on the fork's default branch.
+  push:
+    tags:
+      - "fork-v*"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode 26 (macOS 26 SDK for SwiftUI Liquid Glass)
+        run: |
+          set -euo pipefail
+          echo "Available Xcodes:"; ls -d /Applications/Xcode*.app 2>/dev/null || true
+          XCODE_PATH="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH"
+          else
+            echo "::warning::Xcode 26 not found; using default. macOS 26 SDK code may fail to compile."
+          fi
+          xcodebuild -version
+
+      - name: Download pre-built GhosttyKit.xcframework
+        run: ./scripts/download-prebuilt-ghosttykit.sh
+
+      - name: Build universal cmux.app (Release, unsigned)
+        env:
+          CMUX_SKIP_ZIG_BUILD: "1"
+        run: |
+          set -euo pipefail
+          CMUX_SKIP_ZIG_BUILD=1 xcodebuild \
+            -scheme cmux \
+            -configuration Release \
+            -derivedDataPath build-universal \
+            -destination 'generic/platform=macOS' \
+            -clonedSourcePackagesDirPath .spm-cache \
+            ARCHS="arm64 x86_64" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CMUX_SKIP_ZIG_BUILD=1 \
+            build
+
+      - name: Package app (zip + dmg)
+        id: package
+        run: |
+          set -euo pipefail
+          APP="build-universal/Build/Products/Release/cmux.app"
+          test -d "$APP" || { echo "::error::cmux.app not found at $APP"; exit 1; }
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo 0.0.0)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/cmux-macos.zip"
+          # Unsigned drag-to-install DMG via hdiutil (no Apple identity needed).
+          STAGE="$(mktemp -d)/dmg"
+          mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "cmux" -srcfolder "$STAGE" -ov -format UDZO "dist/cmux-macos.dmg"
+          ls -lh dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Reuse the pushed tag when tag-triggered; otherwise derive one.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="fork-v${{ steps.package.outputs.version }}.${{ github.run_number }}"
+          fi
+          PRERELEASE_FLAG="--prerelease"
+          if [ "${{ inputs.prerelease }}" = "false" ]; then PRERELEASE_FLAG=""; fi
+          gh release create "$TAG" \
+            dist/cmux-macos.dmg dist/cmux-macos.zip \
+            --title "cmux (fork build) $TAG" \
+            --target "${{ github.sha }}" \
+            $PRERELEASE_FLAG \
+            --notes "Unsigned fork build of the normal cmux app (Release config). Not Apple-signed/notarized — on first launch right-click → Open, or run: xattr -dr com.apple.quarantine \"/Applications/cmux.app\". Built from ${{ github.ref_name }} @ ${{ github.sha }}."
