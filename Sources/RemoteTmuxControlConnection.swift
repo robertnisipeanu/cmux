@@ -56,7 +56,7 @@ final class RemoteTmuxControlConnection {
     private let maxRecentEvents = 100
 
     private enum CommandKind: Equatable {
-        case listWindows, capturePane(Int), paneCursor(Int), panePath(Int), other
+        case listWindows, capturePane(Int), paneCursor(Int), panePath(Int), paneAltScreen(Int), other
     }
 
     /// Subscription-name prefix for per-pane `pane_current_path` (`refresh-client -B`).
@@ -206,6 +206,9 @@ final class RemoteTmuxControlConnection {
     /// so client sizing stays one shared behavior rather than duplicated sends.
     func setClientSize(columns: Int, rows: Int) {
         guard !exited, columns > 0, rows > 0 else { return }
+        #if DEBUG
+        cmuxDebugLog("remoteTmux.size.sent \(columns)x\(rows)")
+        #endif
         send("refresh-client -C \(columns)x\(rows)")
     }
 
@@ -225,6 +228,17 @@ final class RemoteTmuxControlConnection {
     /// them to the pane-output observers so a freshly-mounted display surface shows
     /// the existing screen instead of starting blank.
     func capturePane(paneId: Int) {
+        // Match the remote pane's screen (primary vs alternate) BEFORE seeding the
+        // captured rows. An alt-screen TUI (e.g. claude) must render on the mirror's
+        // alternate screen so resize matches the remote (the alternate screen does
+        // not reflow; the primary screen reflows/scrolls and offsets rows). The
+        // pane was already on the alt screen before cmux attached, so its 1049h is
+        // not in the live %output — query `#{alternate_on}` and enter alt ourselves.
+        // Ordered first so the enter lands before the capture paint in the FIFO.
+        sendInternal(
+            "display-message -p -t %\(paneId) -F \"#{alternate_on}\"",
+            kind: .paneAltScreen(paneId)
+        )
         sendInternal("capture-pane -p -e -t %\(paneId)", kind: .capturePane(paneId))
         // Follow with the real cursor position so the surface cursor lines up
         // with tmux's prompt (capture-pane alone doesn't carry the cursor).
@@ -438,6 +452,9 @@ final class RemoteTmuxControlConnection {
                       let node = RemoteTmuxRawLayoutParser.parse(String(parts[1]))
                 else { continue }
                 let name = parts.count >= 3 ? String(parts[2]) : ""
+                #if DEBUG
+                cmuxDebugLog("remoteTmux.listWindows @\(id) \(node.width)x\(node.height)")
+                #endif
                 windowsByID[id] = RemoteTmuxWindow(
                     id: id, name: name, width: node.width, height: node.height, layout: node
                 )
@@ -472,6 +489,19 @@ final class RemoteTmuxControlConnection {
             if let path = lines.first?.trimmingCharacters(in: .whitespaces), !path.isEmpty {
                 emitPaneCwd(paneId, path)
             }
+        case let .paneAltScreen(paneId):
+            // Enter the alternate screen on the mirror surface so it matches the
+            // remote pane (alt = no reflow on resize). Emitted before the capture
+            // paint that follows in the FIFO, so the seeded rows land on the alt
+            // screen. A pane on the primary screen needs no toggle (the surface
+            // defaults to primary, and a later live `%output` 1049l would leave alt).
+            if lines.first?.trimmingCharacters(in: .whitespaces) == "1",
+               let data = "\u{1b}[?1049h".data(using: .utf8) {
+                #if DEBUG
+                cmuxDebugLog("remoteTmux.altScreen.enter %\(paneId)")
+                #endif
+                emitPaneOutput(paneId, data)
+            }
         case .other:
             break
         }
@@ -479,6 +509,9 @@ final class RemoteTmuxControlConnection {
 
     private func applyLayout(windowId: Int, layout: String) {
         guard let node = RemoteTmuxRawLayoutParser.parse(layout) else { return }
+        #if DEBUG
+        cmuxDebugLog("remoteTmux.layout @\(windowId) \(node.width)x\(node.height) raw=\(layout)")
+        #endif
         // Preserve any name tmux already reported (a %layout-change carries no name).
         let existingName = windowsByID[windowId]?.name ?? ""
         windowsByID[windowId] = RemoteTmuxWindow(

@@ -5356,6 +5356,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// and typed input is delivered to ``manualInputHandler``. Used for
     /// remote-tmux pane display surfaces.
     let manualIO: Bool
+    /// `ESC [ ? 7 l` — disable DECAWM (autowrap), used to suppress ghostty's
+    /// reflow/rewrap on resize for mirror surfaces (see ``updateSize``).
+    private static let decawmDisableSequence = Data([0x1b, 0x5b, 0x3f, 0x37, 0x6c])
+    /// `ESC [ ? 7 h` — re-enable DECAWM after a mirror resize.
+    private static let decawmEnableSequence = Data([0x1b, 0x5b, 0x3f, 0x37, 0x68])
     private let manualInputHandler: (@Sendable (Data) -> Void)?
     /// For MANUAL-I/O remote tmux display surfaces: invoked on the main actor
     /// whenever the rendered grid (columns × rows) changes, so the owner can size
@@ -6854,9 +6859,33 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         if sizeChanged {
+            // Mirror (manual-I/O) surfaces must NOT reflow/rewrap their primary
+            // screen on resize. tmux is the authority on a pane's reflow and only
+            // streams the app's incremental post-SIGWINCH redraw (never a full grid
+            // repaint), so a client that reflows independently diverges from tmux —
+            // inline TUIs like claude then render misaligned after a resize. iTerm2
+            // avoids this by never reflowing locally ("tmux owns the grid"). ghostty
+            // reflows iff DECAWM (wraparound) is on at resize time, so disable it
+            // across the resize and restore it after. No writes occur during this
+            // window, so autowrap is otherwise unaffected. (A ghostty "no-reflow
+            // surface" flag would be cleaner but needs a GhosttyKit rebuild.)
+            if manualIO {
+                writeProcessOutput(Self.decawmDisableSequence, to: surface)
+            }
             ghostty_surface_set_size(surface, wpx, hpx)
             lastPixelWidth = wpx
             lastPixelHeight = hpx
+            // Manual-I/O surfaces have no subprocess IO thread to drain the queued
+            // terminal resize, so the cell grid the remote app's %output renders
+            // into can lag the geometric size until some later frame applies it.
+            // render_now runs applyPendingResizeIfNeeded synchronously (with DECAWM
+            // still off, so it also does not reflow), so the buffer matches the
+            // just-set grid before the post-resize %output arrives. Then restore
+            // DECAWM. This fires only on an actual size change (never while typing).
+            if manualIO {
+                ghostty_surface_render_now(surface)
+                writeProcessOutput(Self.decawmEnableSequence, to: surface)
+            }
         }
 
         // Remote tmux display surfaces: keep the remote tmux client sized to the
@@ -6871,6 +6900,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
             if cols > 1, rows > 1,
                lastReportedManualGrid?.columns != cols || lastReportedManualGrid?.rows != rows {
                 lastReportedManualGrid = (cols, rows)
+                #if DEBUG
+                let bufferGrid = mobileRenderGridFrame(stateSeq: 0)
+                    .map { "\($0.frame.columns)x\($0.frame.rows)" } ?? "nil"
+                cmuxDebugLog(
+                    "remoteTmux.surfaceGrid geom=\(cols)x\(rows) buffer=\(bufferGrid) " +
+                    "px=\(grid.width_px)x\(grid.height_px) cell=\(grid.cell_width_px)x\(grid.cell_height_px) " +
+                    "frame=\(wpx)x\(hpx)"
+                )
+                #endif
                 report(cols, rows)
             }
         }
