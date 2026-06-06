@@ -31,7 +31,9 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 40
+    # Universal (arm64+x86_64) Release build + GhosttyKit download can run 30-40+ min
+    # on a slow runner; keep generous headroom so it isn't cancelled mid-build.
+    timeout-minutes: 75
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
