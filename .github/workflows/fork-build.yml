@@ -60,6 +60,18 @@ jobs:
           CMUX_SKIP_ZIG_BUILD: "1"
         run: |
           set -euo pipefail
+          # Start from a clean SwiftPM package + binary-artifact cache. A prior
+          # cancelled/failed run can leave a partial binary artifact (e.g. Sentry's
+          # xcframework zip) that triggers SwiftPM's "already exists in file system"
+          # resolution failure on the next run.
+          rm -rf ~/Library/Caches/org.swift.swiftpm .spm-cache build-universal
+          # Resolve packages once, up front, so a transient resolution hiccup fails
+          # in this step rather than mid-build.
+          CMUX_SKIP_ZIG_BUILD=1 xcodebuild \
+            -scheme cmux \
+            -configuration Release \
+            -clonedSourcePackagesDirPath .spm-cache \
+            -resolvePackageDependencies
           CMUX_SKIP_ZIG_BUILD=1 xcodebuild \
             -scheme cmux \
             -configuration Release \
