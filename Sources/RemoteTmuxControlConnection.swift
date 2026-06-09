@@ -96,12 +96,22 @@ final class RemoteTmuxControlConnection {
     private var pendingReconnectReseed = false
 
     /// Trailing-edge debounce for `refresh-client -C`. SwiftUI layout settle makes the
-    /// rendered grid oscillate (e.g. cols 154→155→156→161→… in ~1s), and each distinct
-    /// value would otherwise send its own `refresh-client -C` → a SIGWINCH/redraw storm
-    /// on the remote per attach. ``setClientSize`` stores the size immediately but
-    /// defers the send to one shot after the size stops changing.
+    /// rendered grid oscillate (e.g. cols 154→155→156→161→…, ~15 distinct grids in
+    /// ~1.3s), and each previously sent its own `refresh-client -C` → ~15 SIGWINCH /
+    /// redraw storms on the remote per attach. We now coalesce them: ``setClientSize``
+    /// stores the size immediately but defers the send to one shot after the size
+    /// stops changing. The fired timer is also the clean "size settled" edge that
+    /// drives the one-shot attach re-seed below.
     private var clientSizeDebounceTask: Task<Void, Never>?
     private static let clientSizeDebounceMs = 180
+
+    #if DEBUG
+    /// DEBUG: while set (a ~2s window armed on `%enter`), the `.output` handler logs
+    /// each `%output` chunk's size + head/tail bytes, so we can SEE whether claude
+    /// does a clean full redraw on attach (a large chunk with `ESC[H`/`ESC[2J`) vs
+    /// nothing (no SIGWINCH). Diagnoses the attach render bug without guessing.
+    private var attachOutputProbeUntil: ContinuousClock.Instant?
+    #endif
 
     /// Base reconnect backoff (seconds); doubled each attempt up to ``reconnectMaxDelaySeconds``.
     private static let reconnectBaseDelaySeconds: Double = 1
@@ -112,7 +122,7 @@ final class RemoteTmuxControlConnection {
     private static let maxStderrBytes = 8 * 1024
 
     private enum CommandKind: Equatable {
-        case listWindows, capturePane(Int), paneState(Int), panePath(Int), paneReflow(Int), paneAltScreen(Int), other
+        case listWindows, capturePane(Int), paneState(Int), panePath(Int), paneReflow(Int), paneAltScreen(Int), sizeProbe(Int), other
     }
 
     /// The lifecycle phase of a control connection.
@@ -376,11 +386,16 @@ final class RemoteTmuxControlConnection {
         // connected — while reconnecting/ended there is no live stdin (the send would
         // silently drop); `reseedAfterReconnect` re-applies the stored size.
         lastClientSize = (columns, rows)
+        #if DEBUG
+        cmuxDebugLog(
+            "remote.size.setClient cols=\(columns) rows=\(rows) state=\(connectionState) "
+                + "connected=\(connectionState == .connected ? 1 : 0)"
+        )
+        #endif
         guard connectionState == .connected else { return }
-        // Coalesce the layout-settle oscillation (the rendered grid can flap through
-        // several distinct sizes as SwiftUI layout settles) into a single send:
-        // (re)arm a short trailing timer; only the last size in a burst goes out, so
-        // the remote sees one resize/SIGWINCH instead of a storm.
+        // Coalesce the layout-settle oscillation into a single send: (re)arm a short
+        // trailing timer; only the last size in a burst actually goes out. The fired
+        // timer is also the "settled" edge that runs the one-shot attach re-seed.
         clientSizeDebounceTask?.cancel()
         clientSizeDebounceTask = Task { @MainActor [weak self] in
             do {
@@ -389,9 +404,41 @@ final class RemoteTmuxControlConnection {
                 return
             }
             guard let self, self.connectionState == .connected, let size = self.lastClientSize else { return }
+            // DEBUG: probe the remote size BEFORE the push (FIFO: this reads the
+            // pre-push size) so we can tell if `refresh-client -C` is a real change
+            // (→ natural SIGWINCH → claude redraws) or a no-op (→ no redraw).
+            #if DEBUG
+            self.probeRemoteSize(tag: "preSend")
+            #endif
             self.send("refresh-client -C \(size.columns)x\(size.rows)")
+            // Do NOT re-capture here. A re-capture would run capture-pane before the
+            // remote app (claude) finishes its post-SIGWINCH redraw, snapshotting the
+            // stale pre-resize frame and clobbering the correct redraw — the exact
+            // narrow/overlap/duplicate bug. A manual resize is clean precisely because
+            // it issues no capture: it lets refresh-client -C → SIGWINCH → the app's
+            // own redraw stream back and paint. Attach now does the same.
+            #if DEBUG
+            self.probeRemoteSize(tag: "postSend")
+            #endif
         }
     }
+
+    #if DEBUG
+    /// Remote-truth size probe (DEBUG): logs the remote's ACTUAL
+    /// client/window/pane geometry. Embeds `tag` in the format so a pre-send vs
+    /// post-send probe is distinguishable in the log → tells us whether our
+    /// `refresh-client -C` is a real size CHANGE (→ natural SIGWINCH → claude
+    /// redraws) or a no-op.
+    private func probeRemoteSize(tag: String) {
+        guard let paneId = windowsByID.values.first?.paneIDsInOrder.first else { return }
+        sendInternal(
+            "display-message -p -t %\(paneId) -F \""
+                + "tag=\(tag) client=#{client_width}x#{client_height} window=#{window_width}x#{window_height} "
+                + "pane=#{pane_width}x#{pane_height} status=#{status}\"",
+            kind: .sizeProbe(paneId)
+        )
+    }
+    #endif
 
     /// Requests the current window list + layouts (used to (re)build topology).
     ///
@@ -782,6 +829,11 @@ final class RemoteTmuxControlConnection {
         case .enter:
             enterReceived = true
             record("enter")
+            #if DEBUG
+            // Arm the ~2s raw-%output probe so the .output handler logs whether claude
+            // does a clean full redraw on attach (natural SIGWINCH) or stays silent.
+            attachOutputProbeUntil = ContinuousClock().now.advanced(by: .seconds(2))
+            #endif
             // First connect, or a reconnect attempt that reached control mode.
             if connectionState != .connected {
                 let wasReconnecting = connectionState == .reconnecting
@@ -806,6 +858,9 @@ final class RemoteTmuxControlConnection {
                     // now. SAFE to send here (unlike the reseed): `refresh-client -C`
                     // is UNCORRELATED (kind .other, no %begin/%end result block), so
                     // it does not touch the command-result FIFO the attach block uses.
+                    #if DEBUG
+                    cmuxDebugLog("remote.size.firstConnectReapply cols=\(size.columns) rows=\(size.rows)")
+                    #endif
                     send("refresh-client -C \(size.columns)x\(size.rows)")
                 }
             }
@@ -822,6 +877,13 @@ final class RemoteTmuxControlConnection {
         case let .output(paneId, data):
             paneOutputByteCounts[paneId, default: 0] += data.count
             totalOutputBytes += data.count
+            #if DEBUG
+            if let until = attachOutputProbeUntil, ContinuousClock().now < until {
+                let head = data.prefix(48).map { String(format: "%02x", $0) }.joined()
+                let tail = data.suffix(24).map { String(format: "%02x", $0) }.joined()
+                cmuxDebugLog("remote.attach.output pane=\(paneId) bytes=\(data.count) head=\(head) tail=\(tail)")
+            }
+            #endif
             observers.emitPaneOutput(paneId, data)
         case let .sessionChanged(id, name):
             sessionId = id
@@ -949,6 +1011,36 @@ final class RemoteTmuxControlConnection {
             // tmux's real prompt cursor — otherwise echoed input lands a line below
             // the prompt. The `.paneState` seed then repositions the cursor within
             // the visible screen.
+            #if DEBUG
+            // Diagnose seed content: strip ESC sequences (CSI + OSC + charset), then
+            // log per-row VISIBLE width and a printable sample, so we can tell whether
+            // capture-pane gives clean full-width rows or already-mangled/duplicated/
+            // over-wide content that we then faithfully paint.
+            let strip: (String) -> String = { s in
+                var t = s.replacingOccurrences(
+                    of: "\u{1b}\\][^\u{07}\u{1b}]*(\u{07}|\u{1b}\\\\)", with: "", options: .regularExpression
+                )
+                t = t.replacingOccurrences(
+                    of: "\u{1b}\\[[0-9;:?]*[ -/]*[@-~]", with: "", options: .regularExpression
+                )
+                t = t.replacingOccurrences(of: "\u{1b}[()][@-~]", with: "", options: .regularExpression)
+                t = t.replacingOccurrences(of: "\u{1b}.", with: "", options: .regularExpression)
+                return t
+            }
+            let stripped = lines.map(strip)
+            let widths = stripped.map { $0.count }
+            cmuxDebugLog(
+                "remote.capture.content pane=\(paneId) lines=\(lines.count) "
+                    + "maxW=\(widths.max() ?? 0) lastW=\(Array(widths.suffix(10)))"
+            )
+            // Sample rows so we can see duplication / over-wide content directly.
+            let sampleIdx = Array(0..<min(4, stripped.count))
+                + Array(max(0, stripped.count - 14)..<stripped.count)
+            for i in sampleIdx {
+                let row = String(stripped[i].prefix(110))
+                cmuxDebugLog("remote.capture.row pane=\(paneId) i=\(i) w=\(widths[i]) | \(row)")
+            }
+            #endif
             let painted = "\u{1b}[H\u{1b}[2J" + lines.joined(separator: "\r\n")
             if let data = painted.data(using: .utf8) {
                 observers.emitPaneOutput(paneId, data)
@@ -959,6 +1051,9 @@ final class RemoteTmuxControlConnection {
             // region (DECSTBM) is the important one: without it an inline TUI's
             // region-relative redraws land on the wrong rows even at a static size.
             if let line = lines.first {
+                #if DEBUG
+                cmuxDebugLog("remote.paneState pane=\(paneId) raw=\(line)")
+                #endif
                 observers.emitPaneOutput(paneId, decoding.paneStateSeedSequence(from: line))
             }
         case let .panePath(paneId):
@@ -969,6 +1064,10 @@ final class RemoteTmuxControlConnection {
             // One-shot reflow classification result (see requestPaneReflow). Empty
             // lines → classifyAndEmitReflow defaults to no-reflow (safe).
             classifyAndEmitReflow(paneId: paneId, rawValue: lines.first ?? "", source: "oneshot")
+        case let .sizeProbe(paneId):
+            #if DEBUG
+            cmuxDebugLog("remote.size.truth pane=\(paneId) \(lines.first ?? "")")
+            #endif
         case let .paneAltScreen(paneId):
             // Match the mirror surface to the remote pane's screen (alt = no reflow on
             // resize). Emitted before the capture paint that follows in the FIFO, so the

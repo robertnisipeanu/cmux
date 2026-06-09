@@ -6890,7 +6890,29 @@ final class TerminalSurface: Identifiable, ObservableObject {
         guard let createdSurface = surface else { return }
         TerminalSurfaceRegistry.shared.registerRuntimeSurface(createdSurface, ownerId: id)
         recordRuntimeSurfaceCreation()
-        // Flush any remote-tmux output that arrived before the surface existed.
+        // Size the surface to its grid BEFORE flushing the buffered seed. The
+        // remote-tmux capture seed is full-width (the remote pane's width); flushing
+        // it while the surface is still at ghostty_surface_new's tiny default grid
+        // truncates/wraps the wide rows, and the later (no-reflow) set_size can't
+        // recover them — the seed then renders narrow/mangled (top of the screen),
+        // while live %output fixes only the bottom. Sizing first paints the seed into
+        // the correct grid. Plain set_size only — NO render_now / DECAWM toggle here
+        // (that races the renderer during init and caused a SIGBUS; see updateSize).
+        ghostty_surface_set_content_scale(createdSurface, scaleFactors.x, scaleFactors.y)
+        let initialBackingSize = view.convertToBacking(NSRect(origin: .zero, size: view.bounds.size)).size
+        let initialWpx = pixelDimension(from: initialBackingSize.width)
+        let initialHpx = pixelDimension(from: initialBackingSize.height)
+        if initialWpx > 0, initialHpx > 0 {
+            ghostty_surface_set_size(createdSurface, initialWpx, initialHpx)
+            lastPixelWidth = initialWpx
+            lastPixelHeight = initialHpx
+            lastUncappedPixelWidth = initialWpx
+            lastUncappedPixelHeight = initialHpx
+            lastXScale = scaleFactors.x
+            lastYScale = scaleFactors.y
+        }
+
+        // Now flush the buffered remote-tmux output into the correctly-sized grid.
         flushPendingRemoteOutput(to: createdSurface)
         // Install the PTY tee so MobileTerminalByteTee receives every byte
         // the read thread produces, in order, before the VT parser runs.
@@ -6927,19 +6949,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
             ghostty_surface_set_display_id(createdSurface, displayID)
         }
 
-        ghostty_surface_set_content_scale(createdSurface, scaleFactors.x, scaleFactors.y)
-        let backingSize = view.convertToBacking(NSRect(origin: .zero, size: view.bounds.size)).size
-        let wpx = pixelDimension(from: backingSize.width)
-        let hpx = pixelDimension(from: backingSize.height)
-        if wpx > 0, hpx > 0 {
-            ghostty_surface_set_size(createdSurface, wpx, hpx)
-            lastPixelWidth = wpx
-            lastPixelHeight = hpx
-            lastUncappedPixelWidth = wpx
-            lastUncappedPixelHeight = hpx
-            lastXScale = scaleFactors.x
-            lastYScale = scaleFactors.y
-        }
+        // (Surface sizing now happens BEFORE the seed flush above, so the captured
+        // full-width rows paint into the correctly-sized grid.)
 
         // Some GhosttyKit builds can drop inherited font_size during post-create
         // config/scale reconciliation. If runtime points don't match the inherited
@@ -7111,6 +7122,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
         guard cols > 1, rows > 1 else { return false }
         if lastReportedManualGrid?.columns != cols || lastReportedManualGrid?.rows != rows {
             lastReportedManualGrid = (cols, rows)
+            #if DEBUG
+            cmuxDebugLog("manualIO.gridReport surface=\(id.uuidString.prefix(8)) cols=\(cols) rows=\(rows)")
+            #endif
             report(cols, rows)
         }
         return true
@@ -7932,6 +7946,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     func setManualIONoReflow(_ value: Bool) {
         guard manualIONoReflow != value else { return }
         manualIONoReflow = value
+        #if DEBUG
+        cmuxDebugLog("manualIO.noReflow surface=\(id.uuidString.prefix(8)) noReflow=\(value ? 1 : 0)")
+        #endif
     }
 
     /// Applies a LIVE-resize surface pixel-size change (from ``updateSize``),
@@ -7987,6 +8004,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
             return
         }
+        #if DEBUG
+        if data.count > 2000 {
+            let g = ghostty_surface_size(surface)
+            cmuxDebugLog(
+                "remote.seedPaint surface=\(id.uuidString.prefix(8)) bytes=\(data.count) "
+                    + "grid=\(g.columns)x\(g.rows) buffered=\(pendingRemoteOutput.count) path=direct"
+            )
+        }
+        #endif
         flushPendingRemoteOutput(to: surface)
         writeProcessOutputData(data, to: surface)
     }
@@ -7995,6 +8021,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
         guard !pendingRemoteOutput.isEmpty else { return }
         let buffered = pendingRemoteOutput
         pendingRemoteOutput = Data()
+        #if DEBUG
+        if buffered.count > 2000 {
+            let g = ghostty_surface_size(surface)
+            cmuxDebugLog(
+                "remote.seedPaint surface=\(id.uuidString.prefix(8)) bytes=\(buffered.count) "
+                    + "grid=\(g.columns)x\(g.rows) path=flush"
+            )
+        }
+        #endif
         writeProcessOutputData(buffered, to: surface)
     }
 
