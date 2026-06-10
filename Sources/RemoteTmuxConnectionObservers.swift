@@ -16,7 +16,7 @@ final class RemoteTmuxConnectionObservers {
 
     private var paneOutputObservers: [Token: (_ paneId: Int, _ data: Data) -> Void] = [:]
     private var paneCwdObservers: [Token: (_ paneId: Int, _ path: String) -> Void] = [:]
-    private var paneReflowObservers: [Token: (_ paneId: Int, _ noReflow: Bool) -> Void] = [:]
+    private var paneReflowObservers: [Token: (_ paneId: Int, _ noReflow: Bool, _ command: String) -> Void] = [:]
     private var activePaneObservers: [Token: (_ windowId: Int, _ paneId: Int) -> Void] = [:]
     private var topologyObservers: [Token: () -> Void] = [:]
     private var exitObservers: [Token: () -> Void] = [:]
@@ -36,7 +36,9 @@ final class RemoteTmuxConnectionObservers {
     ///   - onPaneReflow: receives a pane's reflow classification (`true` =
     ///     suppress reflow on resize, for alt-screen / inline-TUI panes like
     ///     claude; `false` = a plain shell whose primary-screen scrollback may
-    ///     reflow), both the initial value and live changes.
+    ///     reflow), both the initial value and live changes, plus the pane's
+    ///     `pane_current_command` the decision was derived from (used by the
+    ///     title-lifecycle restore to rename a window back to its command).
     ///   - onActivePaneChanged: fires when a window's active pane changes
     ///     (`%window-pane-changed`), so consumers can re-project per-pane state
     ///     (e.g. the active pane's directory) onto the window's tab.
@@ -51,7 +53,7 @@ final class RemoteTmuxConnectionObservers {
     func add(
         onPaneOutput: ((_ paneId: Int, _ data: Data) -> Void)?,
         onPaneCwd: ((_ paneId: Int, _ path: String) -> Void)?,
-        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool) -> Void)?,
+        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool, _ command: String) -> Void)?,
         onActivePaneChanged: ((_ windowId: Int, _ paneId: Int) -> Void)?,
         onTopologyChanged: (() -> Void)?,
         onExit: (() -> Void)?,
@@ -92,8 +94,8 @@ final class RemoteTmuxConnectionObservers {
     }
 
     /// Fans a pane's reflow classification out to every reflow observer.
-    func emitPaneReflow(_ paneId: Int, _ noReflow: Bool) {
-        for callback in Array(paneReflowObservers.values) { callback(paneId, noReflow) }
+    func emitPaneReflow(_ paneId: Int, _ noReflow: Bool, command: String) {
+        for callback in Array(paneReflowObservers.values) { callback(paneId, noReflow, command) }
     }
 
     /// Fans a window's new active pane out to every active-pane observer.

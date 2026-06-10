@@ -246,7 +246,7 @@ final class RemoteTmuxControlConnection {
     func addObserver(
         onPaneOutput: ((_ paneId: Int, _ data: Data) -> Void)? = nil,
         onPaneCwd: ((_ paneId: Int, _ path: String) -> Void)? = nil,
-        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool) -> Void)? = nil,
+        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool, _ command: String) -> Void)? = nil,
         onActivePaneChanged: ((_ windowId: Int, _ paneId: Int) -> Void)? = nil,
         onTopologyChanged: (() -> Void)? = nil,
         onExit: (() -> Void)? = nil,
@@ -662,7 +662,7 @@ final class RemoteTmuxControlConnection {
                 + "alt=\(altOn ? 1 : 0) cmd=\"\(command)\" noReflow=\(noReflow ? 1 : 0)"
         )
         #endif
-        observers.emitPaneReflow(paneId, noReflow)
+        observers.emitPaneReflow(paneId, noReflow, command: command)
     }
 
     /// Subscribes to live reflow-classification changes for `paneId` via tmux

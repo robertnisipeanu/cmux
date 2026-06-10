@@ -11965,7 +11965,7 @@ final class Workspace: Identifiable, ObservableObject {
         // A remote tmux mirror tab rename propagates to `rename-window`.
         if isRemoteTmuxMirror {
             AppDelegate.shared?.remoteTmuxController.handleMirrorWindowRenamed(
-                workspaceId: id, panelId: panelId, title: trimmed
+                workspaceId: id, panelId: panelId, title: trimmed, source: .explicitRename
             )
         }
     }
@@ -12854,7 +12854,7 @@ final class Workspace: Identifiable, ObservableObject {
         // synced, must not be overwritten by the app's title stream).
         if didMutatePanelTitle, isRemoteTmuxMirror, panelCustomTitles[panelId] == nil {
             AppDelegate.shared?.remoteTmuxController.handleMirrorWindowRenamed(
-                workspaceId: id, panelId: panelId, title: trimmed
+                workspaceId: id, panelId: panelId, title: trimmed, source: .surfaceTitle
             )
         }
 
