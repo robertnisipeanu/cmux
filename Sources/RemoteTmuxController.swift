@@ -428,13 +428,22 @@ final class RemoteTmuxController {
         return mirror.requestSplit(windowPanelId: panelId, vertical: vertical)
     }
 
-    /// A mirrored window's tab was renamed → `rename-window` on the remote.
+    /// A mirrored window's tab title changed — an explicit rename or the
+    /// surface's OSC title stream — → `rename-window` on the remote, so the
+    /// tmux window name tracks the tab. Deduped against the window's current
+    /// tmux name (kept fresh by `%window-renamed`), so the rename's own echo
+    /// and topology refreshes never re-send it. Known tmux side effect (same
+    /// as renaming from any client, iTerm2 included): `rename-window` turns
+    /// off `automatic-rename` for that window, so it keeps the last synced
+    /// name after the title-setting app exits instead of reverting to the
+    /// command name.
     func handleMirrorWindowRenamed(workspaceId: UUID, panelId: UUID, title: String?) {
         let name = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty,
               let mirror = sessionMirrors.values.first(where: { $0.mirroredWorkspaceId == workspaceId }),
               !mirror.connection.exited,
-              let windowId = mirror.windowId(forPanel: panelId) else { return }
+              let windowId = mirror.windowId(forPanel: panelId),
+              mirror.connection.windowsByID[windowId]?.name != name else { return }
         mirror.connection.send("rename-window -t @\(windowId) \(RemoteTmuxHost.shellSingleQuoted(name))")
     }
 

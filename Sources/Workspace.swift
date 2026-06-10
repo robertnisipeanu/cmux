@@ -12846,6 +12846,18 @@ final class Workspace: Identifiable, ObservableObject {
             )
         }
 
+        // A surface-reported (OSC) title on a mirror tab syncs to tmux
+        // `rename-window` — same path as an explicit rename in
+        // `setPanelCustomTitle`. Without this the remote window keeps its old
+        // name and the next topology refresh snaps the tab back to it. Skipped
+        // while a custom title pins the tab (the user's explicit name, already
+        // synced, must not be overwritten by the app's title stream).
+        if didMutatePanelTitle, isRemoteTmuxMirror, panelCustomTitles[panelId] == nil {
+            AppDelegate.shared?.remoteTmuxController.handleMirrorWindowRenamed(
+                workspaceId: id, panelId: panelId, title: trimmed
+            )
+        }
+
         // If this is the only panel and no custom title, update workspace title
         if panels.count == 1, customTitle == nil {
             if self.title != trimmed {
