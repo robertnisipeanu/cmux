@@ -122,6 +122,8 @@ final class RemoteTmuxSessionMirror {
     func detachObserver() {
         initialSizingTask?.cancel()
         initialSizingTask = nil
+        for task in trailingRequeryTaskByPane.values { task.cancel() }
+        trailingRequeryTaskByPane.removeAll()
         for observer in surfaceReadyObservers { NotificationCenter.default.removeObserver(observer) }
         surfaceReadyObservers.removeAll()
         if let observerToken {
@@ -232,6 +234,10 @@ final class RemoteTmuxSessionMirror {
         pendingSurfaceTitleByWindow = pendingSurfaceTitleByWindow.filter { liveWindows.contains($0.key) }
         lastReflowByPane = lastReflowByPane.filter { livePanes.contains($0.key) }
         reflowRequeryAt = reflowRequeryAt.filter { livePanes.contains($0.key) }
+        for (paneId, task) in trailingRequeryTaskByPane where !livePanes.contains(paneId) {
+            task.cancel()
+            trailingRequeryTaskByPane[paneId] = nil
+        }
         closeDefaultTabsIfNeeded()
         // Follow out-of-band tmux window reorders (a second client, or a manual
         // move-window / a new-window inserted mid-list): the cmux tabs are created
@@ -448,6 +454,9 @@ final class RemoteTmuxSessionMirror {
     //     sync gate and the rebuild sweep need the CURRENT state (the events
     //     are edges), and the restore renames to the cached command.
     //   reflowRequeryAt  per-pane throttle for the one-shot re-pull.
+    //   trailingRequeryTaskByPane  one trailing-edge retry per pane: a probe
+    //     hitting the throttle re-fires when the window expires, so an exit
+    //     burst's decisive last output (the shell prompt) is never swallowed.
 
     /// Mutate via ``setOSCTitleOwner(windowId:to:)`` (keeps
     /// ``ownedTitlePaneIds`` in sync and resets `sawNameMismatch`) — the one
@@ -458,7 +467,10 @@ final class RemoteTmuxSessionMirror {
     private var pendingSurfaceTitleByWindow: [Int: String] = [:]
     private var lastReflowByPane: [Int: (noReflow: Bool, command: String)] = [:]
     private var reflowRequeryAt: [Int: Date] = [:]
+    private var trailingRequeryTaskByPane: [Int: Task<Void, Never>] = [:]
     private static let reflowRequeryInterval: TimeInterval = 2
+    /// Floor so a nearly-expired throttle doesn't schedule a ~zero sleep.
+    private static let trailingRequeryMinDelay: TimeInterval = 0.05
 
     private func setOSCTitleOwner(windowId: Int, to owner: (paneId: Int, name: String)?) {
         oscTitleOwnerByWindow[windowId] = owner.map { ($0.paneId, $0.name, false) }
@@ -467,12 +479,35 @@ final class RemoteTmuxSessionMirror {
 
     /// Re-pulls a pane's reflow classification via the one-shot query,
     /// throttled (see the section comment for why polling edges is needed).
+    /// A throttled call arms a trailing-edge retry: an exit burst's FIRST
+    /// output triggers a query while the TUI is still alive, and the decisive
+    /// output — the shell prompt printed right after it dies — would otherwise
+    /// be swallowed by the throttle, leaving the restore stuck until the next
+    /// keystroke.
     private func requeryReflow(paneId: Int) {
         let now = Date()
-        if let last = reflowRequeryAt[paneId],
-           now.timeIntervalSince(last) < Self.reflowRequeryInterval { return }
+        if let last = reflowRequeryAt[paneId] {
+            let elapsed = now.timeIntervalSince(last)
+            if elapsed < Self.reflowRequeryInterval {
+                scheduleTrailingRequery(paneId: paneId, after: Self.reflowRequeryInterval - elapsed)
+                return
+            }
+        }
         reflowRequeryAt[paneId] = now
         connection.requestPaneReflow(paneId: paneId)
+    }
+
+    private func scheduleTrailingRequery(paneId: Int, after delay: TimeInterval) {
+        guard trailingRequeryTaskByPane[paneId] == nil else { return }
+        trailingRequeryTaskByPane[paneId] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(max(delay, Self.trailingRequeryMinDelay)))
+            guard let self, !Task.isCancelled else { return }
+            self.trailingRequeryTaskByPane[paneId] = nil
+            // Only owned panes still need the late sample (a gate-blocked
+            // title re-triggers on its own next title event anyway).
+            guard self.ownedTitlePaneIds.contains(paneId) else { return }
+            self.requeryReflow(paneId: paneId)
+        }
     }
 
     /// Syncs a mirror tab's surface (OSC) title to the remote tmux window
