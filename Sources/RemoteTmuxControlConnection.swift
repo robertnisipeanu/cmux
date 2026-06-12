@@ -464,6 +464,11 @@ final class RemoteTmuxControlConnection {
         // connected — while reconnecting/ended there is no live stdin (the send would
         // silently drop); `reseedAfterReconnect` re-applies the stored size.
         lastClientSize = (columns, rows)
+#if DEBUG
+        cmuxDebugLog(
+            "remote.size.set session=\(sessionName) \(columns)x\(rows) state=\(connectionState)"
+        )
+#endif
         guard connectionState == .connected else { return }
         // Coalesce the layout-settle oscillation into a single send: (re)arm a short
         // trailing timer; only the last size in a burst actually goes out. The fired
@@ -476,6 +481,11 @@ final class RemoteTmuxControlConnection {
                 return
             }
             guard let self, self.connectionState == .connected, let size = self.lastClientSize else { return }
+#if DEBUG
+            cmuxDebugLog(
+                "remote.size.send session=\(self.sessionName) \(size.columns)x\(size.rows)"
+            )
+#endif
             self.send("refresh-client -C \(size.columns)x\(size.rows)")
             // This send already applied the stored grid — the deferred first-connect
             // apply would only duplicate it (a deferred reconnect re-seed must stay).
@@ -529,12 +539,12 @@ final class RemoteTmuxControlConnection {
         }
         guard windowAlreadyAtTarget else {
             #if DEBUG
-            cmuxDebugLog("remote.size.kick skip=windowSizeDiffers target=\(size.columns)x\(size.rows)")
+            cmuxDebugLog("remote.size.kick session=\(sessionName) skip=windowSizeDiffers target=\(size.columns)x\(size.rows)")
             #endif
             return
         }
         #if DEBUG
-        cmuxDebugLog("remote.size.kick shrink to \(size.columns)x\(size.rows - 1)")
+        cmuxDebugLog("remote.size.kick session=\(sessionName) shrink to \(size.columns)x\(size.rows - 1)")
         #endif
         attachRedrawKickTask?.cancel()
         attachRedrawKickTask = Task { @MainActor [weak self] in
@@ -554,7 +564,7 @@ final class RemoteTmuxControlConnection {
             // Restore the CURRENT size (the user may have resized during the gap).
             let restore = self.lastClientSize ?? size
             #if DEBUG
-            cmuxDebugLog("remote.size.kick restore to \(restore.columns)x\(restore.rows)")
+            cmuxDebugLog("remote.size.kick session=\(sessionName) restore to \(restore.columns)x\(restore.rows)")
             #endif
             self.send("refresh-client -C \(restore.columns)x\(restore.rows)")
         }
@@ -924,7 +934,14 @@ final class RemoteTmuxControlConnection {
     // MARK: - Internals
 
     private func sendInternal(_ command: String, kind: CommandKind) {
-        guard let stdinHandle else { return }
+        guard let stdinHandle else {
+#if DEBUG
+            cmuxDebugLog(
+                "remote.send.dropped session=\(sessionName) state=\(connectionState) cmd=\(command.prefix(60))"
+            )
+#endif
+            return
+        }
         let line = command.hasSuffix("\n") ? command : command + "\n"
         guard let data = line.data(using: .utf8) else { return }
         do {
