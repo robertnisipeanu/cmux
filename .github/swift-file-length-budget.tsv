@@ -63,10 +63,10 @@
 1496	cmuxUITests/MultiWindowNotificationsUITests.swift
 1448	Sources/FileExplorerStore.swift
 1410	Sources/CommandPalette/CommandPaletteSearch.swift
+1387	Sources/RemoteTmuxControlConnection.swift
 1380	cmuxUITests/MenuKeyEquivalentRoutingUITests.swift
 1376	cmuxTests/KeyboardShortcutSettingsFileStoreStartupTests.swift
 1372	cmuxTests/AppDelegateIssue2907RoutingTests.swift
-1370	Sources/RemoteTmuxControlConnection.swift
 1365	Sources/Feed/FeedButtonStyleDebugWindowController.swift
 1362	Sources/CMUXInstalledExtensionSidebarHostView.swift
 1313	cmuxTests/MobileHostAuthorizationTests.swift
