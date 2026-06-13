@@ -433,14 +433,45 @@ final class RemoteTmuxController {
         return mirror.requestSplit(windowPanelId: panelId, vertical: vertical)
     }
 
-    /// A mirrored window's tab was renamed → `rename-window` on the remote.
-    func handleMirrorWindowRenamed(workspaceId: UUID, panelId: UUID, title: String?) {
+    /// How a mirror tab's title change originated. Decides the remote rename's
+    /// lifetime: an explicit rename pins the name (plain tmux `rename-window`
+    /// semantics — automatic naming stays off), while a surface (OSC) title is
+    /// transient — tmux's automatic naming is restored once the pane returns to
+    /// a plain shell (see ``RemoteTmuxSessionMirror/restoreAutomaticRenameIfNeeded``).
+    enum MirrorRenameSource {
+        case explicitRename
+        case surfaceTitle
+    }
+
+    /// A mirrored window's tab title changed — an explicit rename or the
+    /// surface's OSC title stream — → `rename-window` on the remote, so the
+    /// tmux window name tracks the tab. Deduped against the window's current
+    /// tmux name (kept fresh by `%window-renamed`), so the rename's own echo
+    /// and topology refreshes never re-send it. `rename-window` turns off tmux
+    /// `automatic-rename` for the window; for `.surfaceTitle` renames the
+    /// session mirror restores it when the pane exits to a shell, so the
+    /// window doesn't keep a dead TUI's last title forever.
+    func handleMirrorWindowRenamed(
+        workspaceId: UUID, panelId: UUID, title: String?, source: MirrorRenameSource
+    ) {
         let name = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty,
               let mirror = sessionMirrors.values.first(where: { $0.mirroredWorkspaceId == workspaceId }),
               !mirror.connection.exited,
               let windowId = mirror.windowId(forPanel: panelId) else { return }
-        mirror.connection.send("rename-window -t @\(windowId) \(RemoteTmuxHost.shellSingleQuoted(name))")
+        switch source {
+        case .explicitRename:
+            // Always send — no name dedupe. After a restore re-enabled
+            // automatic naming, pinning the currently-displayed name needs the
+            // rename-window side effect (automatic-rename back off) to stick.
+            mirror.noteWindowNamePinned(windowId: windowId)
+            mirror.connection.send("rename-window -t @\(windowId) \(RemoteTmuxHost.shellSingleQuoted(name))")
+        case .surfaceTitle:
+            // The mirror owns the OSC-title lifetime (TUI-only gate with
+            // held-title replay, name dedupe, ownership for the later
+            // automatic-naming restore).
+            mirror.syncSurfaceTitle(windowId: windowId, name: name)
+        }
     }
 
     /// The live session mirror + tmux window id behind a mirrored window-tab, or

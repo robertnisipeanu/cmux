@@ -59,8 +59,8 @@ final class RemoteTmuxSessionMirror {
             onPaneCwd: { [weak self] paneId, path in
                 self?.handlePaneCwd(paneId: paneId, path: path)
             },
-            onPaneReflow: { [weak self] paneId, noReflow in
-                self?.routeNoReflow(paneId: paneId, noReflow: noReflow)
+            onPaneReflow: { [weak self] paneId, noReflow, command in
+                self?.handlePaneReflow(paneId: paneId, noReflow: noReflow, command: command)
             },
             onActivePaneChanged: { [weak self] windowId, paneId in
                 self?.handleActivePaneChanged(windowId: windowId, paneId: paneId)
@@ -122,6 +122,8 @@ final class RemoteTmuxSessionMirror {
     func detachObserver() {
         initialSizingTask?.cancel()
         initialSizingTask = nil
+        for task in trailingRequeryTaskByPane.values { task.cancel() }
+        trailingRequeryTaskByPane.removeAll()
         for observer in surfaceReadyObservers { NotificationCenter.default.removeObserver(observer) }
         surfaceReadyObservers.removeAll()
         if let observerToken {
@@ -199,6 +201,43 @@ final class RemoteTmuxSessionMirror {
         // stays bounded across window/pane churn (tmux pane ids never recur).
         let livePanes = Set(connection.windowsByID.values.flatMap { $0.paneIDsInOrder })
         cwdByPane = cwdByPane.filter { livePanes.contains($0.key) }
+        // Settle OSC-title ownership against the fresh topology (see the "OSC
+        // title lifetime" section). Sends fire only while the name WE sent is
+        // still current — an out-of-band rename from another client wins.
+        // Iterate a snapshot: both branches mutate the map via setOSCTitleOwner.
+        let ownerSnapshot = oscTitleOwnerByWindow
+        for (windowId, owner) in ownerSnapshot {
+            let paneStillInWindow =
+                connection.windowsByID[windowId]?.paneIDsInOrder.contains(owner.paneId) == true
+            if !paneStillInWindow {
+                // The titling pane died — or was moved/joined into ANOTHER
+                // window — without ever classifying back to a shell, so the
+                // restore path (which resolves a pane to its CURRENT window)
+                // can never settle this entry. Drop it here.
+                setOSCTitleOwner(windowId: windowId, to: nil)
+                if connection.windowsByID[windowId]?.name == owner.name {
+                    sendAutomaticNamingRestore(
+                        windowId: windowId,
+                        command: lastReflowByPane[owner.paneId]?.command ?? ""
+                    )
+                }
+                continue
+            }
+            // Deferred-restore retry: the restore was skipped because our
+            // rename's %window-renamed echo hadn't landed when the shell
+            // classification arrived — that echo itself triggers this rebuild.
+            guard let reflow = lastReflowByPane[owner.paneId], !reflow.noReflow,
+                  connection.windowsByID[windowId]?.name == owner.name else { continue }
+            setOSCTitleOwner(windowId: windowId, to: nil)
+            sendAutomaticNamingRestore(windowId: windowId, command: reflow.command)
+        }
+        pendingSurfaceTitleByWindow = pendingSurfaceTitleByWindow.filter { liveWindows.contains($0.key) }
+        lastReflowByPane = lastReflowByPane.filter { livePanes.contains($0.key) }
+        reflowRequeryAt = reflowRequeryAt.filter { livePanes.contains($0.key) }
+        for (paneId, task) in trailingRequeryTaskByPane where !livePanes.contains(paneId) {
+            task.cancel()
+            trailingRequeryTaskByPane[paneId] = nil
+        }
         closeDefaultTabsIfNeeded()
         // Follow out-of-band tmux window reorders (a second client, or a manual
         // move-window / a new-window inserted mid-list): the cmux tabs are created
@@ -357,6 +396,12 @@ final class RemoteTmuxSessionMirror {
     }
 
     private func routeOutput(paneId: Int, data: Data) {
+        // Exit probe for a pane that owns its window's OSC title: the shell
+        // prompt printed after the TUI dies is itself output, so a throttled
+        // classification re-pull here is what detects the exit on tmux builds
+        // whose `-B` subscription never delivers the change. O(1) set test for
+        // every other pane.
+        if ownedTitlePaneIds.contains(paneId) { requeryReflow(paneId: paneId) }
         // Multi-pane window: its in-tab renderer owns the pane's surface.
         if let windowId = windowIdContaining(pane: paneId),
            let mirror = windowMirrorByWindowId[windowId] {
@@ -368,6 +413,201 @@ final class RemoteTmuxSessionMirror {
               let panelId = panelIdByPane[paneId],
               let panel = workspace.panels[panelId] as? TerminalPanel else { return }
         panel.surface.processRemoteOutput(data)
+    }
+
+    // MARK: - OSC title lifetime
+    //
+    // A TUI's OSC title is mirrored to the tmux window name with rename-window,
+    // which also turns the window's `automatic-rename` off. When the titling
+    // pane returns to a plain shell, naming is handed back to tmux: rename to
+    // the just-classified shell command — tmux recomputes automatic names
+    // LAZILY (only on pane activity AFTER the option changes), so an idle pane
+    // would otherwise keep the dead TUI's name — then unset the window-local
+    // `automatic-rename` override so later command changes rename
+    // automatically again (a user's global automatic-rename choice is
+    // respected). Explicit tab renames pin the name instead (plain tmux
+    // semantics, ``noteWindowNamePinned(windowId:)``), and an out-of-band
+    // rename from another client always wins: restores fire only while the
+    // name WE sent is still the window's current one.
+    //
+    // The `-B` subscription doesn't deliver classification CHANGES on all tmux
+    // builds (see ``RemoteTmuxControlConnection/subscribePaneReflow(paneId:)``),
+    // so edges are re-pulled with the always-working one-shot query: a title
+    // arriving against a (possibly stale seed-time) "shell" classification is
+    // HELD and replayed against the fresh result, and a pane owning its
+    // window's title gets a throttled exit probe on output — the shell prompt
+    // printed after the TUI dies is itself output. All of it is best-effort:
+    // an edge missed entirely settles at the next reconnect (seedPane
+    // re-queries every pane) via the rebuild() ownership sweep.
+    //
+    // State (keyed by tmux window/pane id, pruned in `rebuild()`):
+    //   oscTitleOwnerByWindow  windowId → (titling pane, the name WE sent,
+    //     sawNameMismatch). Recorded only after an actual send. One name
+    //     mismatch at restore time is tolerated (usually our own rename's
+    //     %window-renamed echo still in flight); a second consecutive one
+    //     means another client renamed the window → ownership dropped.
+    //   ownedTitlePaneIds  derived pane-id projection of the owner map, so
+    //     ``routeOutput(paneId:data:)``'s exit probe is an O(1) set test.
+    //   pendingSurfaceTitleByWindow  the held title awaiting a fresh
+    //     classification (replayed or dropped in ``handlePaneReflow``).
+    //   lastReflowByPane  last classification + `pane_current_command`: the
+    //     sync gate and the rebuild sweep need the CURRENT state (the events
+    //     are edges), and the restore renames to the cached command.
+    //   reflowRequeryAt  per-pane throttle for the one-shot re-pull.
+    //   trailingRequeryTaskByPane  one trailing-edge retry per pane: a probe
+    //     hitting the throttle re-fires when the window expires, so an exit
+    //     burst's decisive last output (the shell prompt) is never swallowed.
+
+    /// Mutate via ``setOSCTitleOwner(windowId:to:)`` (keeps
+    /// ``ownedTitlePaneIds`` in sync and resets `sawNameMismatch`) — the one
+    /// deliberate exception is the strike write in
+    /// ``restoreAutomaticRenameIfNeeded(paneId:noReflow:command:)``.
+    private var oscTitleOwnerByWindow: [Int: (paneId: Int, name: String, sawNameMismatch: Bool)] = [:]
+    private var ownedTitlePaneIds: Set<Int> = []
+    private var pendingSurfaceTitleByWindow: [Int: String] = [:]
+    private var lastReflowByPane: [Int: (noReflow: Bool, command: String)] = [:]
+    private var reflowRequeryAt: [Int: Date] = [:]
+    private var trailingRequeryTaskByPane: [Int: Task<Void, Never>] = [:]
+    private static let reflowRequeryInterval: TimeInterval = 2
+    /// Floor so a nearly-expired throttle doesn't schedule a ~zero sleep.
+    private static let trailingRequeryMinDelay: TimeInterval = 0.05
+
+    private func setOSCTitleOwner(windowId: Int, to owner: (paneId: Int, name: String)?) {
+        oscTitleOwnerByWindow[windowId] = owner.map { ($0.paneId, $0.name, false) }
+        ownedTitlePaneIds = Set(oscTitleOwnerByWindow.values.map(\.paneId))
+    }
+
+    /// Re-pulls a pane's reflow classification via the one-shot query,
+    /// throttled (see the section comment for why polling edges is needed).
+    /// A throttled call arms a trailing-edge retry: an exit burst's FIRST
+    /// output triggers a query while the TUI is still alive, and the decisive
+    /// output — the shell prompt printed right after it dies — would otherwise
+    /// be swallowed by the throttle, leaving the restore stuck until the next
+    /// keystroke.
+    private func requeryReflow(paneId: Int) {
+        let now = Date()
+        if let last = reflowRequeryAt[paneId] {
+            let elapsed = now.timeIntervalSince(last)
+            if elapsed < Self.reflowRequeryInterval {
+                scheduleTrailingRequery(paneId: paneId, after: Self.reflowRequeryInterval - elapsed)
+                return
+            }
+        }
+        reflowRequeryAt[paneId] = now
+        connection.requestPaneReflow(paneId: paneId)
+    }
+
+    private func scheduleTrailingRequery(paneId: Int, after delay: TimeInterval) {
+        guard trailingRequeryTaskByPane[paneId] == nil else { return }
+        trailingRequeryTaskByPane[paneId] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(max(delay, Self.trailingRequeryMinDelay)))
+            guard let self, !Task.isCancelled else { return }
+            self.trailingRequeryTaskByPane[paneId] = nil
+            // Only owned panes still need the late sample (a gate-blocked
+            // title re-triggers on its own next title event anyway).
+            guard self.ownedTitlePaneIds.contains(paneId) else { return }
+            self.requeryReflow(paneId: paneId)
+        }
+    }
+
+    /// Syncs a mirror tab's surface (OSC) title to the remote tmux window
+    /// name: held while the cached classification says "shell" (the re-pull
+    /// decides — replay or drop), the send deduped against the window's
+    /// current tmux name, ownership recorded only after an actual send (a
+    /// title merely matching a name another client set never claims the
+    /// window).
+    func syncSurfaceTitle(windowId: Int, name: String) {
+        guard let panelId = panelIdByWindow[windowId],
+              let paneId = panelIdByPane.first(where: { $0.value == panelId })?.key
+        else { return }
+        if lastReflowByPane[paneId]?.noReflow == false {
+            pendingSurfaceTitleByWindow[windowId] = name
+            #if DEBUG
+            cmuxDebugLog("remote.title.hold window=@\(windowId) pane=%\(paneId) name=\"\(name.prefix(32))\"")
+            #endif
+            requeryReflow(paneId: paneId)
+            return
+        }
+        pendingSurfaceTitleByWindow[windowId] = nil
+        guard connection.windowsByID[windowId]?.name != name else { return }
+        #if DEBUG
+        cmuxDebugLog("remote.title.sync window=@\(windowId) pane=%\(paneId) name=\"\(name.prefix(32))\"")
+        #endif
+        connection.send("rename-window -t @\(windowId) \(RemoteTmuxHost.shellSingleQuoted(name))")
+        setOSCTitleOwner(windowId: windowId, to: (paneId, name))
+    }
+
+    /// Pins `windowId`'s name (explicit user rename): plain tmux semantics — the
+    /// name stays until renamed again. Enforced by clearing the ownership
+    /// entry and any held title: nothing is left for the restore path to act on.
+    func noteWindowNamePinned(windowId: Int) {
+        setOSCTitleOwner(windowId: windowId, to: nil)
+        pendingSurfaceTitleByWindow[windowId] = nil
+    }
+
+    /// Sole consumer of classification events. Cache first (the sync gate and
+    /// the rebuild sweep read it), then settle a held title against the fresh
+    /// result (TUI → replay, confirmed shell → drop), then the restore
+    /// attempt, then the surface reflow routing.
+    private func handlePaneReflow(paneId: Int, noReflow: Bool, command: String) {
+        lastReflowByPane[paneId] = (noReflow, command)
+        if let windowId = windowIdContaining(pane: paneId),
+           let pending = pendingSurfaceTitleByWindow[windowId] {
+            pendingSurfaceTitleByWindow[windowId] = nil
+            #if DEBUG
+            cmuxDebugLog(
+                "remote.title.\(noReflow ? "replay" : "dropHeld") window=@\(windowId) "
+                    + "pane=%\(paneId) name=\"\(pending.prefix(32))\""
+            )
+            #endif
+            if noReflow { syncSurfaceTitle(windowId: windowId, name: pending) }
+        }
+        restoreAutomaticRenameIfNeeded(paneId: paneId, noReflow: noReflow, command: command)
+        routeNoReflow(paneId: paneId, noReflow: noReflow)
+    }
+
+    /// The titling pane returned to a plain shell → hand naming back to tmux
+    /// (see the section comment). A name mismatch is tolerated once — usually
+    /// our own rename's `%window-renamed` echo still in flight; the next
+    /// classification result, or the echo's own rebuild sweep, settles it —
+    /// while a second consecutive mismatch means another client renamed the
+    /// window: ownership is dropped so their name survives and the exit probe
+    /// stops re-querying this pane.
+    private func restoreAutomaticRenameIfNeeded(paneId: Int, noReflow: Bool, command: String) {
+        guard !noReflow, let windowId = windowIdContaining(pane: paneId),
+              let owner = oscTitleOwnerByWindow[windowId], owner.paneId == paneId else { return }
+        guard connection.windowsByID[windowId]?.name == owner.name else {
+            if owner.sawNameMismatch {
+                #if DEBUG
+                cmuxDebugLog("remote.title.disown window=@\(windowId) pane=%\(paneId) (renamed elsewhere)")
+                #endif
+                setOSCTitleOwner(windowId: windowId, to: nil)
+            } else {
+                // Direct write, NOT setOSCTitleOwner — that would reset the
+                // strike (the pane id is unchanged, so the projection holds).
+                oscTitleOwnerByWindow[windowId] = (owner.paneId, owner.name, true)
+            }
+            return
+        }
+        setOSCTitleOwner(windowId: windowId, to: nil)
+        sendAutomaticNamingRestore(windowId: windowId, command: command)
+        #if DEBUG
+        cmuxDebugLog("remote.title.restore window=@\(windowId) pane=%\(paneId) cmd=\"\(command)\"")
+        #endif
+    }
+
+    /// Renames `windowId` to `command` — tmux recomputes automatic names
+    /// LAZILY, so without the explicit rename an idle pane keeps the dead
+    /// TUI's name and no `%window-renamed` ever refreshes the tab — then
+    /// unsets the window-local `automatic-rename` override the rename
+    /// re-created, so future command changes rename automatically again.
+    /// The rename is skipped when `command` is empty (pane never classified)
+    /// or already the window's name; the unset always fires.
+    private func sendAutomaticNamingRestore(windowId: Int, command: String) {
+        if !command.isEmpty, connection.windowsByID[windowId]?.name != command {
+            connection.send("rename-window -t @\(windowId) \(RemoteTmuxHost.shellSingleQuoted(command))")
+        }
+        connection.send("set-option -w -u -t @\(windowId) automatic-rename")
     }
 
     /// Applies a pane's reflow classification to its mirror surface (suppress

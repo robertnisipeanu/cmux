@@ -302,7 +302,7 @@ final class RemoteTmuxControlConnection {
     func addObserver(
         onPaneOutput: ((_ paneId: Int, _ data: Data) -> Void)? = nil,
         onPaneCwd: ((_ paneId: Int, _ path: String) -> Void)? = nil,
-        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool) -> Void)? = nil,
+        onPaneReflow: ((_ paneId: Int, _ noReflow: Bool, _ command: String) -> Void)? = nil,
         onActivePaneChanged: ((_ windowId: Int, _ paneId: Int) -> Void)? = nil,
         onTopologyChanged: (() -> Void)? = nil,
         onExit: (() -> Void)? = nil,
@@ -726,7 +726,7 @@ final class RemoteTmuxControlConnection {
                 + "alt=\(state.alternateOn ? 1 : 0) cmd=\"\(state.command)\" noReflow=\(noReflow ? 1 : 0)"
         )
         #endif
-        observers.emitPaneReflow(paneId, noReflow)
+        observers.emitPaneReflow(paneId, noReflow, command: command)
     }
 
     /// The exact `refresh-client -B` line that subscribes `paneId`'s foreground
